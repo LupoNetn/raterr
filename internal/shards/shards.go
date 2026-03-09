@@ -22,16 +22,10 @@ type Job struct {
 	allow chan bool
 }
 
-type Response struct {
-	allowed bool
-	visitor *visitors
-}
-
 type RateLimiter struct {
 	shards     []*Shard
 	shardCount int
 	jobs       chan Job
-	response   chan Response
 }
 
 func NewRateLimiter(shardCount int) *RateLimiter {
@@ -46,7 +40,6 @@ func NewRateLimiter(shardCount int) *RateLimiter {
 		shards:     shardSlice,
 		shardCount: shardCount,
 		jobs:       make(chan Job, 10000),
-		response:   make(chan Response, 10000),
 	}
 
 	//start 8 background workers
@@ -71,20 +64,39 @@ func (rl *RateLimiter) GetShard(key string) *Shard {
 	return shard
 }
 
+func (rl *RateLimiter) Confirm(key string) {
+	shard := rl.GetShard(key)
+	if shard == nil {
+		return
+	}
+
+	shard.mu.Lock()
+	visitor, ok := shard.visitor[key]
+	if !ok {
+		newVisitor :=  &visitors{
+          visitorID: key,
+	      requestCount: 0,
+	      lastVisit: time.Now(),
+		}
+
+		shard.visitor[key] = newVisitor
+        rl.jobs <- newVisitor
+
+	}
+
+
+}
+
 func (rl *RateLimiter) Worker() {
 	for job := range rl.jobs {
 
 		shard := rl.GetShard(job.key)
 		if shard == nil {
 			job.allow <- false
-			rl.response <- Response{
-				allowed: false,
-				visitor: nil,
-			}
 			continue
 		}
 
-		shard.mu.RLock()
+		shard.mu.Lock()
 		visitor, ok := shard.visitor[job.key]
 		if !ok {
 			visitor = &visitors{
@@ -92,26 +104,17 @@ func (rl *RateLimiter) Worker() {
 			}
 			shard.visitor[job.key] = visitor
 		}
-		shard.mu.RUnlock()
+		shard.mu.Unlock()
 
 		if visitor.requestCount > 2 {
 			job.allow <- false
-			rl.response <- Response{
-				allowed: false,
-				visitor: visitor,
-			}
 			continue
 		}
 		visitor.requestCount++
 		job.allow <- true
 
-		rl.response <- Response{
-			allowed: true,
-			visitor: visitor,
-		}
 	}
 }
-
 
 func (rl *RateLimiter) CleanUp() {
 	for _, shard := range rl.shards {
